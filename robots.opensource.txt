@@ -1,0 +1,18 @@
+User-agent: *
+Allow: /
+
+# Keep admin and internal routes out of search indexes
+Disallow: /index.php?p=login
+Disallow: /index.php?p=logout
+Disallow: /index.php?p=analytics
+Disallow: /index.php?p=risk_edit
+Disallow: /index.php?p=risk_save
+Disallow: /index.php?p=risk_delete
+Disallow: /index.php?p=notifications
+
+# Optional noisy query parameters
+Disallow: /*?page=
+Disallow: /*&page=
+
+# Replace with your production domain
+Sitemap: https://example.com/sitemap.xml
