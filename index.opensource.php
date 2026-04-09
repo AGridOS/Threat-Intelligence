@@ -42,7 +42,7 @@ $config = [
 
     // External API settings
     'api' => [
-        'endpoint' => 'https://api.example.com/v1/threats/query',
+        'endpoint' => 'https://globalthreatsignal.org/api/v1/threats/query',
         'api_key' => 'replace_with_api_key',
         'fetch_interval_hours' => 12,
         'timeout_seconds' => 20,
