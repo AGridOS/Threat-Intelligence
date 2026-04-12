@@ -31,6 +31,22 @@ $config = [
         'max_map_threats' => 3000,
     ],
 
+    // Request protection / anti-scraping settings
+    'security' => [
+        'rate_limit_enabled' => true,
+        'session_window_seconds' => 60,
+        'session_max_requests' => 90,
+        'ip_window_seconds' => 60,
+        'ip_max_requests' => 180,
+        'challenge_score_threshold' => 35,
+        'challenge_session_threshold' => 30,
+        'challenge_ip_threshold' => 70,
+        'block_score_threshold' => 85,
+        'block_session_threshold' => 160,
+        'block_ip_threshold' => 320,
+        'human_verify_ttl_seconds' => 1800,
+    ],
+
     // Database (provided)
     'db' => [
         'host' => '127.0.0.1',
@@ -724,6 +740,224 @@ function resetContactChallenge(): void
     unset($_SESSION['contact_human_a'], $_SESSION['contact_human_b']);
 }
 
+function ensureBotChallenge(): void
+{
+    if (!isset($_SESSION['bot_human_a'], $_SESSION['bot_human_b'], $_SESSION['bot_human_op'])) {
+        $_SESSION['bot_human_a'] = random_int(2, 15);
+        $_SESSION['bot_human_b'] = random_int(1, 12);
+        $_SESSION['bot_human_op'] = random_int(0, 1) === 1 ? '+' : '*';
+    }
+}
+
+function getBotChallengeQuestion(): string
+{
+    ensureBotChallenge();
+    $a = (int)$_SESSION['bot_human_a'];
+    $b = (int)$_SESSION['bot_human_b'];
+    $op = (string)$_SESSION['bot_human_op'];
+    return "Solve: {$a} {$op} {$b} = ?";
+}
+
+function verifyBotChallenge(string $answer): bool
+{
+    ensureBotChallenge();
+    if (!preg_match('/^-?\d{1,6}$/', trim($answer))) {
+        return false;
+    }
+    $a = (int)$_SESSION['bot_human_a'];
+    $b = (int)$_SESSION['bot_human_b'];
+    $op = (string)$_SESSION['bot_human_op'];
+    $expected = $op === '*' ? ($a * $b) : ($a + $b);
+    return ((int)$answer) === $expected;
+}
+
+function resetBotChallenge(): void
+{
+    unset($_SESSION['bot_human_a'], $_SESSION['bot_human_b'], $_SESSION['bot_human_op']);
+}
+
+function isHumanVerified(array $config): bool
+{
+    $until = (int)($_SESSION['human_verified_until'] ?? 0);
+    return $until > time();
+}
+
+function markHumanVerified(array $config): void
+{
+    $ttl = max(300, (int)($config['security']['human_verify_ttl_seconds'] ?? 1800));
+    $_SESSION['human_verified_until'] = time() + $ttl;
+}
+
+function rateLimitDir(array $config): string
+{
+    $base = dirname((string)($config['api']['log_file'] ?? (__DIR__ . '/logs/threat-api.log')));
+    $dir = $base . '/ratelimit';
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0775, true);
+    }
+    return $dir;
+}
+
+function updateHitWindow(array $hits, int $windowSeconds): array
+{
+    $now = time();
+    $minTs = $now - max(1, $windowSeconds);
+    $filtered = [];
+    foreach ($hits as $ts) {
+        $n = (int)$ts;
+        if ($n >= $minTs && $n <= $now + 2) {
+            $filtered[] = $n;
+        }
+    }
+    $filtered[] = $now;
+    return $filtered;
+}
+
+function updateIpHitWindow(array $config, string $ip, int $windowSeconds): array
+{
+    $file = rateLimitDir($config) . '/' . sha1($ip) . '.json';
+    $stored = [];
+    if (is_file($file)) {
+        $raw = @file_get_contents($file);
+        $decoded = is_string($raw) ? json_decode($raw, true) : null;
+        if (is_array($decoded) && isset($decoded['hits']) && is_array($decoded['hits'])) {
+            $stored = $decoded['hits'];
+        }
+    }
+
+    $updated = updateHitWindow($stored, $windowSeconds);
+    @file_put_contents($file, json_encode(['hits' => $updated], JSON_UNESCAPED_UNICODE));
+    return $updated;
+}
+
+function botScoreForRequest(string $page): int
+{
+    $score = 0;
+    $ua = strtolower(trim((string)($_SERVER['HTTP_USER_AGENT'] ?? '')));
+    $accept = strtolower(trim((string)($_SERVER['HTTP_ACCEPT'] ?? '')));
+    $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
+    $uri = strtolower((string)($_SERVER['REQUEST_URI'] ?? ''));
+
+    if ($ua === '') {
+        $score += 30;
+    }
+
+    $botSignals = [
+        'bot', 'spider', 'crawler', 'scrapy', 'python-requests', 'curl/', 'wget/',
+        'httpclient', 'go-http-client', 'axios', 'aiohttp', 'java/', 'okhttp',
+    ];
+    foreach ($botSignals as $sig) {
+        if ($ua !== '' && str_contains($ua, $sig)) {
+            $score += 35;
+            break;
+        }
+    }
+
+    if ($accept === '' || $accept === '*/*') {
+        $score += 8;
+    }
+
+    if (!in_array($method, ['GET', 'POST'], true)) {
+        $score += 25;
+    }
+
+    if (in_array($page, ['show_threat_details', 'risk_view'], true)) {
+        $score += 6;
+    }
+
+    if (preg_match('/[?&]page=\d{2,}/', $uri) === 1) {
+        $score += 8;
+    }
+
+    if (preg_match('/[?&](offset|limit)=\d+/', $uri) === 1) {
+        $score += 8;
+    }
+
+    return $score;
+}
+
+function sanitizeReturnTarget(string $target): string
+{
+    $target = trim($target);
+    $target = preg_replace('/[\r\n]+/', '', $target) ?? '';
+    if ($target === '' || str_contains($target, '://') || str_starts_with($target, '//')) {
+        return 'index.php';
+    }
+    if (str_starts_with($target, '/')) {
+        return $target;
+    }
+    if (!str_starts_with($target, 'index.php')) {
+        return 'index.php';
+    }
+    return $target;
+}
+
+function evaluateRequestProtection(array $config, string $page): array
+{
+    if (isAdminLoggedIn()) {
+        return ['blocked' => false, 'require_challenge' => false, 'bot_score' => 0, 'session_hits' => 0, 'ip_hits' => 0];
+    }
+
+    if (!(bool)($config['security']['rate_limit_enabled'] ?? true)) {
+        return ['blocked' => false, 'require_challenge' => false, 'bot_score' => 0, 'session_hits' => 0, 'ip_hits' => 0];
+    }
+
+    $protectedPages = [
+        'home', 'show_threat_details', 'risk_assessments', 'risk_view', 'sitemap', 'notifications',
+    ];
+    if (!in_array($page, $protectedPages, true)) {
+        return ['blocked' => false, 'require_challenge' => false, 'bot_score' => 0, 'session_hits' => 0, 'ip_hits' => 0];
+    }
+
+    $sessionWindowSeconds = max(10, (int)($config['security']['session_window_seconds'] ?? 60));
+    $sessionHits = updateHitWindow((array)($_SESSION['rate_limit_hits'] ?? []), $sessionWindowSeconds);
+    $_SESSION['rate_limit_hits'] = $sessionHits;
+
+    $ipWindowSeconds = max(10, (int)($config['security']['ip_window_seconds'] ?? 60));
+    $ip = getClientIp();
+    $ipHits = updateIpHitWindow($config, $ip, $ipWindowSeconds);
+
+    $sessionCount = count($sessionHits);
+    $ipCount = count($ipHits);
+    $botScore = botScoreForRequest($page);
+
+    $block =
+        $botScore >= (int)($config['security']['block_score_threshold'] ?? 85)
+        || $sessionCount >= (int)($config['security']['block_session_threshold'] ?? 160)
+        || $ipCount >= (int)($config['security']['block_ip_threshold'] ?? 320);
+
+    if ($block) {
+        return [
+            'blocked' => true,
+            'require_challenge' => false,
+            'bot_score' => $botScore,
+            'session_hits' => $sessionCount,
+            'ip_hits' => $ipCount,
+        ];
+    }
+
+    $rateExceeded =
+        $sessionCount >= (int)($config['security']['session_max_requests'] ?? 90)
+        || $ipCount >= (int)($config['security']['ip_max_requests'] ?? 180);
+
+    $needsChallenge =
+        !isHumanVerified($config)
+        && (
+            $rateExceeded
+            || $botScore >= (int)($config['security']['challenge_score_threshold'] ?? 35)
+            || $sessionCount >= (int)($config['security']['challenge_session_threshold'] ?? 30)
+            || $ipCount >= (int)($config['security']['challenge_ip_threshold'] ?? 70)
+        );
+
+    return [
+        'blocked' => false,
+        'require_challenge' => $needsChallenge,
+        'bot_score' => $botScore,
+        'session_hits' => $sessionCount,
+        'ip_hits' => $ipCount,
+    ];
+}
+
 function sanitizePlainInput(string $value, int $maxLen = 255): string
 {
     $value = strip_tags($value);
@@ -827,6 +1061,7 @@ $error = '';
 
 $allowedPages = [
     'home',
+    'verify-human',
     'sitemap',
     'show_threat_details',
     'risk_assessments',
@@ -847,6 +1082,48 @@ if (!in_array($p, $allowedPages, true)) {
 }
 
 sendSecurityHeaders();
+
+if ($p === 'verify-human' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $answer = trim((string)($_POST['human_check'] ?? ''));
+    $returnTarget = sanitizeReturnTarget((string)($_POST['return'] ?? 'index.php'));
+    if (!verifyCsrfToken()) {
+        $error = 'Invalid form token. Please retry.';
+    } elseif (!verifyBotChallenge($answer)) {
+        $error = 'Verification failed. Please solve the challenge correctly.';
+    } else {
+        markHumanVerified($config);
+        resetBotChallenge();
+        header('Location: ' . $returnTarget);
+        exit;
+    }
+}
+
+if ($p === 'verify-human') {
+    ensureBotChallenge();
+}
+
+$protection = evaluateRequestProtection($config, (string)$p);
+if (($protection['blocked'] ?? false) === true) {
+    http_response_code(429);
+    if ($p === 'notifications') {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['error' => 'Too many requests']);
+    } else {
+        echo 'Too many requests. Please try again later.';
+    }
+    exit;
+}
+
+if (($protection['require_challenge'] ?? false) === true && $p !== 'verify-human') {
+    if (strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== 'GET') {
+        http_response_code(429);
+        echo 'Human verification required.';
+        exit;
+    }
+    $target = sanitizeReturnTarget((string)($_SERVER['REQUEST_URI'] ?? 'index.php'));
+    header('Location: index.php?p=verify-human&return=' . urlencode($target));
+    exit;
+}
 
 if ($p === 'logout') {
     session_unset();
@@ -1161,7 +1438,7 @@ function getSeoMeta(string $p, PDO $pdo, array $config): array
         return $default;
     }
 
-    if (in_array($p, ['login', 'analytics', 'risk_edit', 'risk_save', 'risk_delete', 'logout', 'notifications'], true)) {
+    if (in_array($p, ['login', 'analytics', 'risk_edit', 'risk_save', 'risk_delete', 'logout', 'notifications', 'verify-human'], true)) {
         $default['robots'] = 'noindex,nofollow';
         return $default;
     }
@@ -1979,6 +2256,23 @@ elseif ($p === 'contact') {
                 <input type="text" name="human_check" inputmode="numeric" pattern="[0-9]*" required>
             </label>
             <button type="submit">Send message</button>
+        </form>
+    </section>
+    <?php
+}
+elseif ($p === 'verify-human') {
+    $returnTarget = sanitizeReturnTarget((string)($_GET['return'] ?? ($_POST['return'] ?? 'index.php')));
+    ?>
+    <section class="card" style="max-width:560px;margin-inline:auto;">
+        <h2 style="margin-top:0;">Human Verification</h2>
+        <p>We detected unusual traffic. Please solve this quick math challenge to continue.</p>
+        <form method="post" action="index.php?p=verify-human">
+            <input type="hidden" name="csrf_token" value="<?= e(getCsrfToken()) ?>">
+            <input type="hidden" name="return" value="<?= e($returnTarget) ?>">
+            <label><?= e(getBotChallengeQuestion()) ?>
+                <input type="text" name="human_check" inputmode="numeric" required>
+            </label>
+            <button type="submit">Verify</button>
         </form>
     </section>
     <?php
