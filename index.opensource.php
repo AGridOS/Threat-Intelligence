@@ -65,26 +65,28 @@ $config = [
         'limit' => 500,
         'log_enabled' => true,
         'log_file' => __DIR__ . '/logs/threat-api.log',
+        'log_retention_days' => 30,
     ],
 
     // Contact/admin settings
     'admin' => [
-        'email' => 'admin@example.com',
-        // Admin password (plain text or password_hash() output). Change immediately.
-        'password' => 'ChangeMeNow!123',
+        // Set these via environment or deployment-specific config.
+        'email' => '',
+        // Admin password hash (recommended) or plain text for local testing only.
+        'password' => 'REPLACE_WITH_ADMIN_PASSWORD_OR_HASH',
     ],
 
     // Mail transport settings for app emails
     'mail' => [
-        'from_email' => 'no-reply@example.com',
+        'from_email' => '',
         'from_name' => 'Example Threat Map',
         // If empty, app falls back to admin.email above.
-        'admin_email' => 'admin@example.com',
+        'admin_email' => '',
         // SMTP reference values (example)
-        'smtp_host' => 'smtp.example.com',
+        'smtp_host' => '',
         'smtp_port' => 587,
-        'smtp_username' => 'smtp-user@example.com',
-        'smtp_password' => 'change_me',
+        'smtp_username' => '',
+        'smtp_password' => '',
         'smtp_secure' => 'tls',
         // This app sends via PHP mail() by default.
     ],
@@ -93,6 +95,47 @@ $config = [
 function e(string $v): string
 {
     return htmlspecialchars($v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function pruneApiLogIfDue(array $config): void
+{
+    $retentionDays = max(1, (int)($config['api']['log_retention_days'] ?? 30));
+    $logFile = (string)($config['api']['log_file'] ?? (__DIR__ . '/logs/threat-api.log'));
+    if ($logFile === '' || !is_file($logFile)) {
+        return;
+    }
+
+    $markerFile = $logFile . '.prune.marker';
+    $today = date('Y-m-d');
+    $lastRun = is_file($markerFile) ? trim((string)@file_get_contents($markerFile)) : '';
+    if ($lastRun === $today) {
+        return;
+    }
+
+    $lines = @file($logFile, FILE_IGNORE_NEW_LINES);
+    if (!is_array($lines) || !$lines) {
+        @file_put_contents($markerFile, $today, LOCK_EX);
+        return;
+    }
+
+    $cutoffTs = time() - ($retentionDays * 86400);
+    $kept = [];
+    foreach ($lines as $line) {
+        if (preg_match('/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/', $line, $m) === 1) {
+            $lineTs = strtotime($m[1]);
+            if ($lineTs !== false && $lineTs < $cutoffTs) {
+                continue;
+            }
+        }
+        $kept[] = $line;
+    }
+
+    if (count($kept) !== count($lines)) {
+        $content = $kept ? implode(PHP_EOL, $kept) . PHP_EOL : '';
+        @file_put_contents($logFile, $content, LOCK_EX);
+    }
+
+    @file_put_contents($markerFile, $today, LOCK_EX);
 }
 
 function appLog(array $config, string $message, array $context = []): void
@@ -107,6 +150,8 @@ function appLog(array $config, string $message, array $context = []): void
     if (!is_dir($logDir)) {
         @mkdir($logDir, 0775, true);
     }
+
+    pruneApiLogIfDue($config);
 
     $line = '[' . date('Y-m-d H:i:s') . '] ' . $message;
     if ($context) {
@@ -416,6 +461,10 @@ function fetchThreatEventsFromApi(array $config): array
     $offset = 0;
     $maxOffset = 5000;
     $result = [];
+    $rateWindowSeconds = 60.0;
+    $maxCallsPerWindow = 3;
+    $apiWindowStart = microtime(true);
+    $apiCallsInWindow = 0;
 
     if ($apiKey === '') {
         appLog($config, 'API fetch aborted: missing API key');
@@ -429,11 +478,24 @@ function fetchThreatEventsFromApi(array $config): array
         'api_key_length' => strlen($apiKey),
     ]);
 
+    $host = parse_url($endpoint, PHP_URL_HOST) ?: 'globalthreatsignal.org';
+    $requestHeaders = [
+        'Accept: application/json',
+        'Content-Type: application/json',
+        'X-API-Key: ' . $apiKey,
+        'User-Agent: ExampleThreatMap/1.0 (+https://example.com)',
+        'Accept-Language: en-US,en;q=0.9',
+        'Host: ' . $host,
+    ];
+
     do {
         $payload = [
             'countries' => apiEuropeCountriesFilter(),
             'include_reviewed_by_human' => true,
             'include_advanced_ai' => true,
+            'include_direct_response_threats' => true,
+            'include_direct_response_sources' => true,
+            // Legacy compatibility flag (kept intentionally).
             'include_direct_response' => true,
             'include_inactive' => false,
             'limit' => $limit,
@@ -447,25 +509,77 @@ function fetchThreatEventsFromApi(array $config): array
             'include_inactive' => $payload['include_inactive'],
         ]);
 
-        $ch = curl_init($endpoint);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => (int)$config['api']['timeout_seconds'],
-            CURLOPT_CONNECTTIMEOUT => 8,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE),
-            CURLOPT_HTTPHEADER => [
-                'Accept: application/json',
-                'Content-Type: application/json',
-                'X-API-Key: ' . $apiKey,
-            ],
-        ]);
+        $response = '';
+        $httpCode = 0;
+        $curlErrNo = 0;
+        $curlErr = '';
+        $maxAttempts = 3;
 
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $curlErrNo = curl_errno($ch);
-        $curlErr = curl_error($ch);
-        curl_close($ch);
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            $now = microtime(true);
+            if (($now - $apiWindowStart) >= $rateWindowSeconds) {
+                $apiWindowStart = $now;
+                $apiCallsInWindow = 0;
+            }
+            if ($apiCallsInWindow >= $maxCallsPerWindow) {
+                $waitSeconds = (int)ceil($rateWindowSeconds - ($now - $apiWindowStart));
+                if ($waitSeconds > 0) {
+                    appLog($config, 'API throttle wait', [
+                        'wait_seconds' => $waitSeconds,
+                        'reason' => 'max 3 calls/min safeguard',
+                    ]);
+                    sleep($waitSeconds);
+                }
+                $apiWindowStart = microtime(true);
+                $apiCallsInWindow = 0;
+            }
+
+            $ch = curl_init($endpoint);
+            $curlOptions = [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => (int)$config['api']['timeout_seconds'],
+                CURLOPT_CONNECTTIMEOUT => 8,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_MAXREDIRS => 2,
+                CURLOPT_ENCODING => '',
+                CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE),
+                CURLOPT_HTTPHEADER => $requestHeaders,
+            ];
+
+            // Fallback for hosts with outdated CA bundles (only on final retry).
+            if ($attempt === $maxAttempts) {
+                $curlOptions[CURLOPT_SSL_VERIFYPEER] = false;
+                $curlOptions[CURLOPT_SSL_VERIFYHOST] = 0;
+            }
+
+            curl_setopt_array($ch, $curlOptions);
+            $apiCallsInWindow++;
+            $response = curl_exec($ch);
+            $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlErrNo = curl_errno($ch);
+            $curlErr = curl_error($ch);
+            curl_close($ch);
+
+            appLog($config, 'API request attempt result', [
+                'offset' => $offset,
+                'attempt' => $attempt,
+                'http_code' => $httpCode,
+                'curl_errno' => $curlErrNo,
+                'curl_error' => $curlErr,
+                'ssl_verification_relaxed' => $attempt === $maxAttempts,
+            ]);
+
+            $ok = is_string($response) && $response !== '' && $httpCode > 0 && $httpCode < 400 && $curlErrNo === 0;
+            if ($ok) {
+                break;
+            }
+
+            if ($attempt < $maxAttempts) {
+                usleep($attempt * 250000);
+            }
+        }
 
         appLog($config, 'API response received', [
             'http_code' => $httpCode,
@@ -557,7 +671,7 @@ function fetchThreatEventsFromApi(array $config): array
             'region' => (string)($item['region'] ?? $item['area'] ?? 'Europe'),
             'latitude' => $lat,
             'longitude' => $lng,
-            'details_url' => (string)($item['details_url'] ?? $item['url'] ?? ''),
+            'details_url' => (string)($item['details_url'] ?? $item['detail_url'] ?? $item['url'] ?? ''),
             'summary' => $summary,
             'long_description' => $longDescription,
             'status' => 'active',
